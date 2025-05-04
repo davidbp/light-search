@@ -36,14 +36,14 @@ class InvertedIndex:
             pickle.dump(self.word_freq, f)
 
         with open(os.path.join(folder_store, 'doc_freq.pkl'), 'wb') as f:
-            pickle.dump(self.doc_frequencies, f)
+            pickle.dump(self.doc_freq, f)
 
 
     def index(self, docs, folder_store="inv_index_store"):
 
-        word2pos, sorted_tuples_by_term_id, doc_frequencies, word_freq = get_vocabulary_and_tdf_tuples(docs)
+        word2pos, sorted_tuples_by_term_id, doc_freq, word_freq = get_vocabulary_and_tdf_tuples(docs)
         self.word2pos =  word2pos
-        self.doc_frequencies = doc_frequencies
+        self.doc_freq = doc_freq
         self.word_freq = word_freq
 
         grouped_data, sorted_term_keys = build_inv_index_from_tdf_tuples(sorted_tuples_by_term_id)
@@ -236,6 +236,23 @@ class InvertedIndex:
         return result
 
     def intersection(self, postings_a, postings_b):
+        pointer_a = 0
+        pointer_b = 0
+        result = []
+
+        while pointer_a < len(postings_a) and pointer_b < len(postings_b):
+            if postings_a[pointer_a] == postings_b[pointer_b]:
+                result.append(postings_a[pointer_a])
+                pointer_a += 1
+                pointer_b += 1
+            elif postings_a[pointer_a] < postings_b[pointer_b]:
+                pointer_a += 1
+            else:
+                pointer_b += 1
+
+        return result
+    
+    def intersection_old(self, postings_a, postings_b):
         pointer_a = 0
         pointer_b = 0
         value_a =  postings_a[0]

@@ -1,5 +1,7 @@
 from collections import defaultdict
 import re
+import struct
+import pickle
 
 token_pattern = r'(?u)\b\w+\b'
 tokenizer = re.compile(token_pattern)

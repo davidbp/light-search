@@ -111,4 +111,4 @@ class TableSerializer:
         return pd.DataFrame(results)
 
     def __str__(self):
-        return f"VariableBinStorage(columns={self.columns}, variable={self.variable_length_columns}, path='{self.bin_path}')"
+        return f"TableSerializer(columns={self.columns}, path='{self.bin_path}')"
