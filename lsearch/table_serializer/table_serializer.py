@@ -3,6 +3,9 @@ import pandas as pd
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Optional, Union
+from concurrent.futures import ProcessPoolExecutor
+import mmap
+
 
 class TableSerializer:
     """
@@ -92,28 +95,73 @@ class TableSerializer:
             ValueError: If DataFrame schema does not match the expected schema.
         """
         self._validate_schema(df)
+        rows = df.itertuples(index=False)
+        packer = struct.Struct(self.struct_fmt).pack
+
         with open(self.bin_path, 'wb') as f_bin, open(self.index_path, 'w') as f_idx:
             offset = 0
-            for _, row in df.iterrows():
+            for row in rows:
                 self.record_offsets.append(offset)
                 f_idx.write(str(offset) + '\n')
 
                 # Write fixed-length columns
                 if self.columns:
-                    fixed_values = [row[col] for col in self.columns]
-                    packed = struct.pack(self.struct_fmt, *fixed_values)
+                    fixed_values = [getattr(row, col) for col in self.columns]
+                    packed_fixed = packer(*fixed_values)
                     f_bin.write(packed)
                     offset += len(packed)
 
                 # Write variable-length columns
-                for var_col in self.variable_length_columns:
-                    raw = row[var_col].encode('utf-8')
+                for col in self.variable_length_columns:
+                    raw = getattr(row, col).encode('utf-8')
                     if self.compress:
                         raw = zlib.compress(raw)
                     length = len(raw)
                     f_bin.write(struct.pack('I', length))
                     f_bin.write(raw)
                     offset += 4 + length
+
+    def serialize_batch(self, df: pd.DataFrame) -> None:
+        """
+        Serializes the DataFrame to a binary file and an accompanying index file.
+
+        Args:
+            df: DataFrame to serialize.
+
+        Raises:
+            ValueError: If DataFrame schema does not match the expected schema.
+        """
+        self._validate_schema(df)
+
+        # Prepare faster methods
+        rows = df.itertuples(index=False)
+        packer = struct.Struct(self.struct_fmt).pack
+        buffer = bytearray()
+        offset = 0
+
+        # Open files once
+        with open(self.bin_path, 'wb') as f_bin, open(self.index_path, 'w') as f_idx:
+            for row in rows:
+                f_idx.write(f"{offset}\n")
+
+                # Fixed-length column serialization
+                fixed_values = [getattr(row, col) for col in self.columns]
+                packed_fixed = packer(*fixed_values)
+                buffer.extend(packed_fixed)
+                offset += len(packed_fixed)
+
+                # Variable-length column serialization
+                for col in self.variable_length_columns:
+                    raw = getattr(row, col).encode('utf-8')
+                    if self.compress:
+                        raw = zlib.compress(raw)
+                    length = len(raw)
+                    buffer.extend(struct.pack('I', length))
+                    buffer.extend(raw)
+                    offset += 4 + length
+
+            # Write the whole buffer at once
+            f_bin.write(buffer)
 
     def _read_single_row(self, f) -> Dict[str, Union[int, float, str]]:
         """
@@ -197,6 +245,93 @@ class TableSerializer:
             executor.map(read_one, range(len(indices)))
 
         return pd.DataFrame(results)
+    
+    def read_rows_parallel_mmap(self, indices: List[int], max_workers: int = 4) -> pd.DataFrame:
+        """
+        Reads rows in parallel using memory-mapped I/O for faster access.
+
+        Args:
+            indices: List of row indices to read.
+            max_workers: Maximum number of threads to use.
+
+        Returns:
+            A pandas DataFrame containing the selected rows.
+        """
+        offsets = self._load_offsets()
+        record_positions = [(i, offsets[i]) for i in indices]
+
+        with open(self.bin_path, 'rb') as f_bin:
+            mmapped_file = mmap.mmap(f_bin.fileno(), 0, access=mmap.ACCESS_READ)
+
+            def read_from_mmap(pos: int) -> Dict[str, Union[int, float, str]]:
+                # Create a memoryview to simulate a file-like read interface
+                view = memoryview(mmapped_file)[pos:]
+                result = {}
+                cursor = 0
+
+                if self.columns:
+                    fixed_size = struct.calcsize(self.struct_fmt)
+                    fixed_values = struct.unpack(self.struct_fmt, view[:fixed_size])
+                    result.update(dict(zip(self.columns, fixed_values)))
+                    cursor += fixed_size
+
+                for var_col in self.variable_length_columns:
+                    length = struct.unpack('I', view[cursor:cursor+4])[0]
+                    cursor += 4
+                    raw = view[cursor:cursor+length].tobytes()
+                    if self.compress:
+                        raw = zlib.decompress(raw)
+                    result[var_col] = raw.decode('utf-8')
+                    cursor += length
+
+                return result
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                results = list(executor.map(lambda x: read_from_mmap(x[1]), record_positions))
+
+        return pd.DataFrame(results)
+
+
+    def read_rows_parallel_multiprocess(self, indices: List[int], max_workers: int = 4) -> pd.DataFrame:
+        """
+        Reads rows in parallel using multiple processes (faster decompression, avoids GIL).
+
+        Args:
+            indices: List of row indices to read.
+            max_workers: Number of worker processes.
+
+        Returns:
+            DataFrame with requested rows.
+        """
+        offsets = self._load_offsets()
+        positions = [(self.bin_path, self.struct_fmt, self.columns, self.variable_length_columns,
+                    self.compress, offsets[i]) for i in indices]
+
+        def read_from_disk(args):
+            path, struct_fmt, columns, var_cols, compress, offset = args
+            result = {}
+            with open(path, 'rb') as f:
+                f.seek(offset)
+
+                if columns:
+                    fixed_size = struct.calcsize(struct_fmt)
+                    fixed_bytes = f.read(fixed_size)
+                    fixed_values = struct.unpack(struct_fmt, fixed_bytes)
+                    result.update(dict(zip(columns, fixed_values)))
+
+                for var_col in var_cols:
+                    length = struct.unpack('I', f.read(4))[0]
+                    raw = f.read(length)
+                    if compress:
+                        raw = zlib.decompress(raw)
+                    result[var_col] = raw.decode('utf-8')
+            return result
+
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            results = list(executor.map(read_from_disk, positions))
+
+        return pd.DataFrame(results)
+
 
     def __str__(self) -> str:
         """
